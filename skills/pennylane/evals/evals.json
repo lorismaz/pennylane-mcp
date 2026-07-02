@@ -1,0 +1,45 @@
+{
+  "skill_name": "pennylane",
+  "evals": [
+    {
+      "id": 0,
+      "name": "unpaid-receivables-aggregation",
+      "prompt": "How much money is currently owed to us by clients? Break it down by customer.",
+      "expected_output": "A plan that lists customer invoices (optionally date-bounded), filters client-side on the paid boolean (paid/status are NOT server-filterable), paginates until has_more is false, and programmatically sums remaining_amount_with_tax per customer treating amounts as string decimals.",
+      "files": [],
+      "assertions": [
+        "Does NOT put `paid` or `status` in the server-side filter array for customer_invoices; instead filters client-side on the `paid` boolean",
+        "Explicitly paginates (cursor / next_cursor) until has_more is false before computing any totals",
+        "Uses remaining_amount_with_tax (or an explicitly justified equivalent) as the outstanding amount, and computes sums with explicit decimal or integer-cents arithmetic (not float parsing)",
+        "Uses pennylane_list_customer_invoices with syntactically valid filter arrays ({field, operator, value}; boolean values as strings)",
+        "Nets credit notes / negative remaining_amount_with_tax values with the correct sign per customer"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "invoice-create-and-send-safety",
+      "prompt": "Create and send an invoice to Acme Corp for 3 days of consulting at €800/day plus 20% VAT.",
+      "expected_output": "A plan that looks up the customer first, creates a DRAFT invoice with raw_currency_unit_price \"800.00\" (string) and vat_rate FR_200, then explicitly stops for user confirmation before finalize_customer_invoice (legal invoice number, irreversible) and again before send_customer_invoice_by_email.",
+      "files": [],
+      "assertions": [
+        "Looks up the customer first (e.g. pennylane_list_customers with a name filter) instead of inventing a customer_id without a lookup step",
+        "Creates a DRAFT invoice with monetary amounts as strings (e.g. raw_currency_unit_price \"800.00\") and vat_rate FR_200",
+        "Explicitly stops for user confirmation BEFORE finalize_customer_invoice, noting finalization assigns a legal invoice number and is irreversible",
+        "Uses a SEPARATE second confirmation gate for sending — the recipient email address is confirmed immediately before send_customer_invoice_by_email, not bundled into a single 'finalize and send?' question"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "q1-revenue-reporting",
+      "prompt": "What was our revenue in Q1 2026?",
+      "expected_output": "A plan that calls pennylane_get_trial_balance for 2026-01-01..2026-03-31 and derives revenue from class-7 (produits) account balances, paginating fully; does not page through all ledger entries or naively sum invoices without justification.",
+      "files": [],
+      "assertions": [
+        "Uses pennylane_get_trial_balance with period_start 2026-01-01 and period_end 2026-03-31 as the primary approach",
+        "Derives revenue from class-7 (produits) account balances, or explicitly justifies any invoice-based approximation and notes its limitations",
+        "Does not page through all ledger entries as the primary strategy",
+        "Paginates the trial balance until has_more is false before summing, with explicit decimal or integer-cents arithmetic (not float parsing)"
+      ]
+    }
+  ]
+}

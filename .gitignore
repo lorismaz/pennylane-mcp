@@ -1,0 +1,27 @@
+# Secrets — NEVER commit real tokens
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling / OS
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+
+# Skill eval workspace (generated test runs)
+.claude/skills/pennylane-workspace/
+skills/pennylane-workspace/

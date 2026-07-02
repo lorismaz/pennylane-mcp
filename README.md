@@ -1,0 +1,194 @@
+# Serveur MCP Pennylane
+
+[![tests](https://github.com/lorismaz/pennylane-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/lorismaz/pennylane-mcp/actions/workflows/tests.yml)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
+![API](https://img.shields.io/badge/Pennylane-Company%20API%20v2-brightgreen.svg)
+
+🇬🇧 [English version](README.en.md)
+
+Un serveur [Model Context Protocol](https://modelcontextprotocol.io) (MCP) pour **[Pennylane](https://www.pennylane.com)**, la plateforme tout-en-un de gestion financière et comptable des PME françaises. Il expose l'**API Company v2** de Pennylane aux clients MCP comme Claude Desktop : un assistant peut ainsi lire vos données comptables — factures, clients, fournisseurs, transactions bancaires, grand livre et rapports — et écrire sur la quasi-totalité de l'API.
+
+- **83 outils** — toute la surface de lecture, plus une couverture d'écriture quasi complète (création / modification / suppression sur les ventes, les achats, la banque, la comptabilité, les abonnements et les mandats).
+- **Multi-sociétés** — configurez autant de sociétés Pennylane que vous voulez, chacune avec son propre token d'API, et choisissez la société à chaque appel.
+- **Accès générique en lecture seule** (`pennylane_get`) : atteint n'importe quel endpoint `GET` v2 qui n'a pas encore d'outil dédié.
+- **Prêt pour la production** — respecte la limite de 25 requêtes / 5 s de Pennylane (nouvelle tentative automatique sur `429` via `retry-after`), la pagination par curseur et le langage de filtres documenté.
+
+> Ce serveur cible l'**API Company** (une entreprise par token). L'API Firm (destinée aux cabinets comptables gérant de nombreux clients) est une base distincte et n'est pas couverte ici.
+
+## Statut
+
+Un serveur volontairement simple, distribué en un seul fichier `server.py`. Les lectures sont sans risque. Les écritures couvrent désormais presque toute l'API v2, y compris quelques actions **destructrices** (finaliser, supprimer, délettrer, annuler), signalées par `destructiveHint` dans les annotations MCP de chaque outil. Validez vos flux d'écriture avec un token **sandbox** Pennylane avant de vous y fier en production. Quelques endpoints de niche / BETA (import de factures électroniques, certains champs de mandats et de comptes bancaires) acceptent un objet `body`/`fields` passé tel quel, car Pennylane n'a pas publié leur schéma complet — l'API valide à la soumission.
+
+## Outils
+
+### Outils de lecture
+
+| Outil | Domaine | Rôle |
+|------|--------|---------|
+| `pennylane_list_companies` | Config | Liste les sociétés configurées dans ce serveur (noms uniquement) |
+| `pennylane_whoami` | Config | Vérifie un token et affiche le compte (`GET /me`) |
+| `pennylane_list_customer_invoices` | Ventes | Factures de vente et avoirs, avec filtres |
+| `pennylane_get_customer_invoice` | Ventes | Une facture client par ID |
+| `pennylane_list_customers` | Ventes | Clients (sociétés + particuliers) |
+| `pennylane_list_products` | Ventes | Produits / services |
+| `pennylane_list_supplier_invoices` | Achats | Factures d'achat, avec filtres |
+| `pennylane_get_supplier_invoice` | Achats | Une facture fournisseur par ID |
+| `pennylane_list_suppliers` | Achats | Fournisseurs |
+| `pennylane_list_transactions` | Banque | Transactions bancaires |
+| `pennylane_list_ledger_entries` | Comptabilité | Écritures comptables |
+| `pennylane_list_ledger_accounts` | Comptabilité | Plan comptable (pour résoudre les IDs de comptes) |
+| `pennylane_list_journals` | Comptabilité | Journaux comptables |
+| `pennylane_get_trial_balance` | Rapports | Balance générale sur une période |
+| `pennylane_get` | Générique | **N'importe quel endpoint `GET` v2** (devis, journaux, catégories, changelogs, paiements, …) |
+
+### Outils d'écriture
+
+Couverture d'écriture v2 quasi complète — **68 outils d'écriture** sur tous les domaines :
+
+| Domaine | Ce que vous pouvez écrire |
+|--------|--------------------|
+| **Factures clients** | créer / modifier / supprimer un brouillon · finaliser · envoyer par e-mail · marquer payée · importer (PDF) · créer depuis un devis · catégoriser · lier un avoir · facturation électronique (import, envoi à la PA) · joindre une annexe |
+| **Devis** | créer · modifier · changer le statut · envoyer par e-mail · joindre une annexe |
+| **Clients & produits** | créer / modifier des clients (sociétés et particuliers) · créer / modifier des produits · catégoriser |
+| **Fournisseurs & factures fournisseurs** | créer / modifier un fournisseur · importer (PDF) · modifier · statut de paiement & de facture électronique · valider la comptabilisation · catégoriser · lier une demande d'achat |
+| **Banque & rapprochement** | créer / modifier une transaction · rapprocher & **détacher** des transactions · catégoriser · créer un compte bancaire |
+| **Comptabilité** | créer un journal · créer / modifier un compte du plan comptable · créer / modifier une écriture · lettrer / délettrer des lignes · créer / modifier des catégories · déclencher les exports FEC / grand livre / analytique |
+| **Abonnements & fichiers** | créer / modifier un abonnement de facturation · téléverser une pièce jointe · joindre des annexes (facture / devis / document) |
+| **Mandats de prélèvement** | SEPA : créer / modifier / supprimer · GoCardless : associer / e-mail / annuler · Compte Pro : migrer / e-mail |
+
+⚠️ **À manier avec précaution** — ces outils modifient ou suppriment un état légal/comptable et portent `destructiveHint` dans leurs annotations MCP :
+
+- **Irréversibles :** `finalize_customer_invoice`, `create_customer_invoice_from_quote` (avec `draft=false`)
+- **Suppression / annulation :** `delete_draft_customer_invoice`, `unmatch_*_transaction`, `unletter_ledger_entry_lines`, `delete_sepa_mandate`, `cancel_gocardless_mandate`
+- **Envoi réel d'e-mails :** `send_customer_invoice_by_email`, `send_quote_by_email`, `send_customer_invoice_to_pa`, `*_mail_request`
+
+Tout le reste relève de la création/modification. **Les montants sont des chaînes de caractères** dans toute l'API.
+
+**Import de dépenses :** `pennylane_upload_file_attachment` (retourne un `id`) → `pennylane_import_supplier_invoice` (passez-le en `file_attachment_id`). Les montants sont des chaînes, et la somme des lignes doit être égale au total de la facture.
+
+## Prérequis
+
+- Python **3.10+**
+- Un token **API Company** Pennylane (un par société). Créez-le dans Pennylane sous **Paramètres → Connectivité / API**.
+
+## Installation
+
+```bash
+git clone https://github.com/lorismaz/pennylane-mcp.git
+cd pennylane-mcp
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Configuration
+
+Les **scopes** du token déterminent ce que le serveur peut faire. Pour les outils de lecture, accordez les scopes `:readonly` (par ex. `customer_invoices:readonly`, `suppliers:readonly`, `transactions:readonly`, `ledger_accounts:readonly`, `ledger_entries:readonly`, `trial_balance:readonly`). Pour les outils d'écriture, accordez `customers:all`, `customer_invoices:all`, `supplier_invoices:all` et `file_attachments:all` selon vos besoins.
+
+> **Conseil :** créez d'abord une **sandbox** (menu profil → *Environnement de test*) et utilisez son token pendant le développement.
+
+Copiez le fichier d'exemple et ajoutez vos tokens :
+
+```bash
+cp .env.example .env
+# éditez .env et collez votre/vos vrai(s) token(s)
+```
+
+`server.py` **charge automatiquement `.env`** depuis son propre dossier ou le répertoire courant — inutile de faire `source`. Les variables d'environnement existantes ont toujours la priorité : un bloc `env` de Claude Desktop n'est donc jamais écrasé.
+
+### Multi-sociétés
+
+Les noms de sociétés sont entièrement libres — ils viennent de votre configuration et ne sont jamais codés en dur. La configuration la plus simple (et sans piège shell) : une variable par société.
+
+```bash
+PENNYLANE_API_KEY_ACME=<token_acme>
+PENNYLANE_API_KEY_BETA=<token_beta>
+PENNYLANE_DEFAULT_COMPANY=acme
+```
+
+Alternatives :
+
+| Variable | Usage |
+|----------|-----|
+| `PENNYLANE_API_KEY_<NOM>` | Un token par société ; `<NOM>` devient le nom de la société (recommandé) |
+| `PENNYLANE_COMPANIES` | Un objet JSON : `'{"acme":"...","beta":"..."}'` (guillemets simples si vous faites `source`) |
+| `PENNYLANE_API_KEY` (+ `PENNYLANE_COMPANY_NAME`) | Mode mono-société |
+| `PENNYLANE_DEFAULT_COMPANY` | Société utilisée quand un appel omet `company` |
+| `PENNYLANE_USE_2026_CHANGES` | Active/désactive le comportement API 2026 (défaut `true`) |
+| `PENNYLANE_API_BASE_URL` | Remplace la base de l'API (rarement utile) |
+
+Vous préférez une isolation forte plutôt que des requêtes multi-sociétés ? Enregistrez `server.py` plusieurs fois dans votre client MCP, chaque instance en mode mono-société avec son propre `PENNYLANE_API_KEY` — le client préfixe les outils par serveur.
+
+### Vérification
+
+```bash
+python server.py --help    # affiche la config + la liste de vos sociétés configurées
+```
+
+Puis, depuis un client MCP, appelez `pennylane_whoami` pour confirmer que le token fonctionne.
+
+## Claude Desktop
+
+Ajoutez ceci à `claude_desktop_config.json` (**Paramètres → Développeur → Modifier la config**), avec des chemins absolus :
+
+```json
+{
+  "mcpServers": {
+    "pennylane": {
+      "command": "/chemin/complet/vers/pennylane-mcp/.venv/bin/python",
+      "args": ["/chemin/complet/vers/pennylane-mcp/server.py"],
+      "env": {
+        "PENNYLANE_COMPANIES": "{\"acme\":\"<token_acme>\",\"beta\":\"<token_beta>\"}",
+        "PENNYLANE_DEFAULT_COMPANY": "acme"
+      }
+    }
+  }
+}
+```
+
+Redémarrez Claude Desktop : les outils Pennylane apparaissent.
+
+## Skill Claude Code
+
+Le dépôt inclut une [Agent Skill](https://code.claude.com/docs/en/skills) dans [`skills/pennylane/SKILL.md`](skills/pennylane/SKILL.md) qui apprend à Claude ce que les descriptions d'outils ne peuvent pas porter individuellement : les enchaînements multi-outils (cycle de vie d'une facture, import de dépenses PDF, rapprochement), les niveaux de sécurité en écriture avec points de confirmation, la discipline d'agrégation (pagination complète, arithmétique décimale), et un aide-mémoire du plan comptable général (PCG) pour répondre aux questions financières à partir de la balance.
+
+Elle se charge automatiquement dans les sessions Claude Code ouvertes dans ce dépôt (via un lien symbolique `.claude/skills/pennylane`). Pour l'utiliser partout où le serveur MCP est configuré, copiez-la dans votre dossier global de skills :
+
+```bash
+cp -r skills/pennylane ~/.claude/skills/pennylane
+```
+
+Pour **Claude Desktop**, ajoutez-la via Réglages → Fonctionnalités → Skills (importez le dossier `skills/pennylane` ou un zip de celui-ci).
+
+## Notes d'utilisation
+
+- **Choisissez une société** en passant `company: "beta"` sur n'importe quel outil ; omettez-le pour utiliser la société par défaut.
+- **Les filtres** utilisent la syntaxe en tableau de Pennylane : `[{"field":"date","operator":"gteq","value":"2026-01-01"}]`. Opérateurs : `eq, not_eq, lt, lteq, gt, gteq, in, not_in, start_with`. Les booléens prennent des valeurs chaînes (`"true"` / `"false"`).
+- **La pagination** fonctionne par curseur : les réponses contiennent `has_more` et `next_cursor` ; renvoyez `next_cursor` dans le paramètre `cursor`.
+- **Les montants sont des chaînes.** Pennylane v2 attend `"100.00"`, pas un nombre.
+- **Limite de débit :** 25 requêtes / 5 s par token. Le serveur réessaie automatiquement sur `429` via `retry-after`.
+- **Changements API 2026 :** le serveur envoie `X-Use-2026-API-Changes: true` par défaut (comportement obligatoire à partir du 01/07/2026). Ne mettez `PENNYLANE_USE_2026_CHANGES=false` que si vous avez temporairement besoin de l'ancien comportement.
+- **Reporting à grande échelle :** pour des extractions complètes du grand livre, préférez les endpoints d'**export** FEC / grand livre analytique et les endpoints de **changelog** (via `pennylane_get`) plutôt que de lister toutes les écritures en boucle.
+
+## Sécurité
+
+- Les tokens sont lus depuis l'environnement et ne sont **jamais** renvoyés par un outil.
+- `.env` est ignoré par git par défaut (voir `.gitignore`) — gardez-y vos vrais tokens et ne les committez jamais. Si un token fuite, faites-le tourner dans Pennylane.
+- Préférez les scopes `:readonly` sauf si un flux a réellement besoin d'écrire.
+
+## Contribuer
+
+Les issues et pull requests sont les bienvenues. Tout le serveur tient dans `server.py` ; chaque outil est une fonction décorée dont la docstring guide le modèle — ajouter un endpoint revient donc généralement à ajouter une fonction.
+
+### Tests
+
+Des tests de contrat hors ligne vérifient que chaque outil envoie la bonne **méthode et le bon chemin** HTTP (httpx est mocké : rien ne touche la vraie API et aucun token n'est envoyé). Un garde-fou de couverture échoue si un outil est ajouté sans cas de test correspondant.
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+```
+
+## Licence
+
+[MIT](LICENSE)

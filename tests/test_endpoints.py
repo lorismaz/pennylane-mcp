@@ -53,6 +53,10 @@ def http(monkeypatch):
     # Deterministic single-company config — never the user's real tokens.
     monkeypatch.setattr(server, "COMPANIES", {"acme": "test-token"})
     monkeypatch.setattr(server, "DEFAULT_COMPANY", None)
+    # Deterministic firm config (raising=False so the fixture also works while
+    # the firm feature is not implemented yet — tests then fail, not error).
+    monkeypatch.setattr(server, "FIRM_TOKEN", "firm-test-token", raising=False)
+    monkeypatch.setattr(server, "FIRM_DEFAULT_COMPANY_ID", None, raising=False)
     return requests
 
 
@@ -257,7 +261,9 @@ def test_method_and_path(http, func, params, method, path):
 def test_every_registered_tool_is_covered():
     """Guard: adding a tool without a test case fails here."""
     registered = {t.name for t in server.mcp._tool_manager.list_tools()}
-    covered = {f.__name__ for f, *_ in CASES} | {"pennylane_list_companies"}
+    covered = ({f.__name__ for f, *_ in CASES}
+               | {name for name, *_ in FIRM_CASES}
+               | {"pennylane_list_companies"})
     missing = registered - covered
     assert not missing, f"tools with no test case: {sorted(missing)}"
 
@@ -306,3 +312,181 @@ def test_unknown_company_raises_no_request(http):
     out = asyncio.run(server.pennylane_whoami(server.CompanyOnly(company="nope")))
     assert http == []
     assert "Unknown company" in out
+
+
+# =========================================================================== #
+# Firm API (cabinet / accounting-firm token) — /api/external/firm/v1
+# =========================================================================== #
+# The Firm API is a SEPARATE API from Company v2: its own base URL, the client
+# company selected via /companies/{company_id}/ in the path, page-based
+# pagination on the firm-level companies list, and no 2026 opt-in header.
+# Params are built lazily (lambdas) so this file still collects while the
+# feature is unimplemented — each case then FAILS instead of erroring.
+
+# (tool name, params factory, expected method, expected path under firm/v1)
+FIRM_CASES = [
+    # --- firm-level ---
+    ("pennylane_firm_list_companies", lambda: S.FirmListCompaniesInput(),
+     "GET", "companies"),
+    ("pennylane_firm_get_company", lambda: S.FirmGetCompanyInput(company_id=7),
+     "GET", "companies/7"),
+
+    # --- company-scoped reads (cursor pagination) ---
+    ("pennylane_firm_list_customers", lambda: S.FirmListInput(company_id=7),
+     "GET", "companies/7/customers"),
+    ("pennylane_firm_list_suppliers", lambda: S.FirmListInput(company_id=7),
+     "GET", "companies/7/suppliers"),
+    ("pennylane_firm_list_journals", lambda: S.FirmListInput(company_id=7),
+     "GET", "companies/7/journals"),
+    ("pennylane_firm_list_ledger_accounts", lambda: S.FirmListInput(company_id=7),
+     "GET", "companies/7/ledger_accounts"),
+    ("pennylane_firm_list_ledger_entries", lambda: S.FirmListInput(company_id=7),
+     "GET", "companies/7/ledger_entries"),
+    ("pennylane_firm_list_ledger_entry_lines", lambda: S.FirmListInput(company_id=7),
+     "GET", "companies/7/ledger_entry_lines"),
+    ("pennylane_firm_list_fiscal_years", lambda: S.FirmListInput(company_id=7),
+     "GET", "companies/7/fiscal_years"),
+    ("pennylane_firm_get_trial_balance",
+     lambda: S.FirmTrialBalanceInput(company_id=7, period_start="2026-01-01",
+                                     period_end="2026-12-31"),
+     "GET", "companies/7/trial_balance"),
+    ("pennylane_firm_get",
+     lambda: S.FirmGenericGetInput(company_id=7, path="categories"),
+     "GET", "companies/7/categories"),
+
+    # --- company-scoped writes ---
+    ("pennylane_firm_create_journal",
+     lambda: S.FirmCreateJournalInput(company_id=7, code="VE", label="Sales"),
+     "POST", "companies/7/journals"),
+    ("pennylane_firm_create_ledger_account",
+     lambda: S.FirmCreateLedgerAccountInput(company_id=7, number="706000", label="Rev"),
+     "POST", "companies/7/ledger_accounts"),
+    ("pennylane_firm_update_ledger_account",
+     lambda: S.FirmUpdateByIdInput(company_id=7, id="1", fields=FIELDS),
+     "PUT", "companies/7/ledger_accounts/1"),
+    ("pennylane_firm_create_ledger_entry",
+     lambda: S.FirmCreateLedgerEntryInput(company_id=7, date="2026-01-01", label="entry",
+                                          journal_id=1, ledger_entry_lines=LEDGER_LINES),
+     "POST", "companies/7/ledger_entries"),
+    ("pennylane_firm_update_ledger_entry",
+     lambda: S.FirmUpdateByIdInput(company_id=7, id="1", fields=FIELDS),
+     "PUT", "companies/7/ledger_entries/1"),
+    ("pennylane_firm_create_fiscal_year",
+     lambda: S.FirmCreateFiscalYearInput(company_id=7, start="2026-01-01",
+                                         finish="2026-12-31"),
+     "POST", "companies/7/fiscal_years"),
+    ("pennylane_firm_create_transaction",
+     lambda: S.FirmCreateTransactionInput(company_id=7, bank_account_id=1, label="x",
+                                          date="2026-01-01", amount="1.00"),
+     "POST", "companies/7/transactions"),
+    ("pennylane_firm_update_transaction",
+     lambda: S.FirmUpdateByIdInput(company_id=7, id="1", fields=FIELDS),
+     "PUT", "companies/7/transactions/1"),
+    ("pennylane_firm_create_bank_account",
+     lambda: S.FirmCreateWithFieldsInput(company_id=7, fields={"name": "Main"}),
+     "POST", "companies/7/bank_accounts"),
+    ("pennylane_firm_create_export",
+     lambda: S.FirmCreateExportInput(company_id=7, kind="fec", period_start="2026-01-01",
+                                     period_end="2026-12-31"),
+     "POST", "companies/7/exports/fecs"),
+    ("pennylane_firm_upload_file_attachment",
+     lambda: S.FirmUploadFileInput(company_id=7, file_path=TMP_PDF),
+     "POST", "companies/7/file_attachments"),
+    ("pennylane_firm_upload_dms_file",
+     lambda: S.FirmUploadDmsFileInput(company_id=7, file_path=TMP_PDF),
+     "POST", "companies/7/dms/files"),
+    ("pennylane_firm_create_dms_folder",
+     lambda: S.FirmCreateDmsFolderInput(company_id=7, name="2026"),
+     "POST", "companies/7/dms/folders"),
+]
+
+
+@pytest.mark.parametrize("name,make_params,method,path", FIRM_CASES,
+                         ids=[name for name, *_ in FIRM_CASES])
+def test_firm_method_and_path(http, name, make_params, method, path):
+    func = getattr(server, name, None)
+    assert func is not None, f"server has no firm tool '{name}'"
+    result = asyncio.run(func(make_params()))
+    assert len(http) == 1, f"expected exactly one request; got {len(http)}. result={result!r}"
+    req = http[0]
+    assert req.method == method
+    assert str(req.url).split("?")[0] == f"{server.FIRM_API_BASE_URL}/{path}"
+
+
+def test_firm_base_url_is_firm_v1():
+    assert server.FIRM_API_BASE_URL == "https://app.pennylane.com/api/external/firm/v1"
+
+
+def test_firm_auth_uses_firm_token(http):
+    asyncio.run(server.pennylane_firm_list_companies(server.FirmListCompaniesInput()))
+    assert http[0].headers["authorization"] == "Bearer firm-test-token"
+
+
+def test_firm_request_omits_2026_header(http):
+    """The 2026 changes only concern Company v2 — never send the header to firm/v1."""
+    asyncio.run(server.pennylane_firm_list_companies(server.FirmListCompaniesInput()))
+    assert "x-use-2026-api-changes" not in http[0].headers
+
+
+def test_firm_tool_without_token_errors_no_request(http, monkeypatch):
+    monkeypatch.setattr(server, "FIRM_TOKEN", None)
+    out = asyncio.run(server.pennylane_firm_list_companies(server.FirmListCompaniesInput()))
+    assert http == []
+    assert "PENNYLANE_FIRM_API_KEY" in out
+
+
+def test_firm_default_company_id_fallback(http, monkeypatch):
+    monkeypatch.setattr(server, "FIRM_DEFAULT_COMPANY_ID", 42)
+    asyncio.run(server.pennylane_firm_list_customers(server.FirmListInput()))
+    assert str(http[0].url).split("?")[0] == f"{server.FIRM_API_BASE_URL}/companies/42/customers"
+
+
+def test_firm_missing_company_id_errors_no_request(http):
+    out = asyncio.run(server.pennylane_firm_list_customers(server.FirmListInput()))
+    assert http == []
+    assert "company_id" in out
+
+
+def test_firm_list_companies_uses_page_pagination(http):
+    """Firm-level /companies paginates with page/per_page, not cursor/limit."""
+    asyncio.run(server.pennylane_firm_list_companies(
+        server.FirmListCompaniesInput(page=2, per_page=50)))
+    q = dict(httpx.QueryParams(http[0].url.query))
+    assert q["page"] == "2"
+    assert q["per_page"] == "50"
+    assert "cursor" not in q and "limit" not in q
+
+
+def test_firm_trial_balance_query_params(http):
+    asyncio.run(server.pennylane_firm_get_trial_balance(server.FirmTrialBalanceInput(
+        company_id=7, period_start="2026-01-01", period_end="2026-12-31", page=3)))
+    q = dict(httpx.QueryParams(http[0].url.query))
+    assert q["period_start"] == "2026-01-01"
+    assert q["period_end"] == "2026-12-31"
+    assert q["page"] == "3"
+
+
+def test_firm_export_agl_path_and_body(http):
+    asyncio.run(server.pennylane_firm_create_export(server.FirmCreateExportInput(
+        company_id=7, kind="analytical_general_ledger",
+        period_start="2026-01-01", period_end="2026-12-31", mode="in_line")))
+    req = http[0]
+    assert str(req.url).split("?")[0] == \
+        f"{server.FIRM_API_BASE_URL}/companies/7/exports/analytical_general_ledgers"
+    body = json.loads(req.content)
+    assert body == {"period_start": "2026-01-01", "period_end": "2026-12-31",
+                    "mode": "in_line"}
+
+
+def test_firm_create_journal_body_requires_code_and_label(http):
+    asyncio.run(server.pennylane_firm_create_journal(
+        server.FirmCreateJournalInput(company_id=7, code="VE", label="Sales")))
+    assert json.loads(http[0].content) == {"code": "VE", "label": "Sales"}
+
+
+def test_firm_generic_get_rejects_absolute_and_firm_level_paths(http):
+    """pennylane_firm_get is company-scoped: it must not escape companies/{id}/."""
+    out = asyncio.run(server.pennylane_firm_get(
+        server.FirmGenericGetInput(company_id=7, path="../companies")))
+    assert http == []
+    assert "path" in out.lower()

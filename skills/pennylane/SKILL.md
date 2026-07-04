@@ -6,14 +6,15 @@ description: >-
   suppliers, bank transactions, the ledger, and reports. Use this skill
   whenever the user mentions Pennylane, invoices/factures, quotes/devis,
   credit notes/avoirs, suppliers/fournisseurs, bank reconciliation,
-  lettrage, VAT/TVA, trial balance/balance générale, FEC exports, or any
+  lettrage, VAT/TVA, trial balance/balance générale, FEC exports, accounting
+  firms/cabinets and their client dossiers (pennylane_firm_* tools), or any
   French bookkeeping task, even if they don't name Pennylane explicitly —
   if pennylane_* tools are available, consult this skill before calling them.
 ---
 
 # Using the Pennylane MCP
 
-The server's 83 tools each document their own parameters, filters, and field
+The server's 107 tools each document their own parameters, filters, and field
 semantics in their descriptions — read those for per-tool details (they're
 good). This skill covers only what individual tool descriptions can't:
 cross-call discipline, write safety, multi-step workflows, and the French
@@ -37,7 +38,32 @@ accounting context needed to answer finance questions correctly.
   writing!) the wrong books. `pennylane_list_companies` shows what's set up.
 - **Errors:** tools return error text instead of raising. A 403 means the
   token lacks a scope — say so rather than retrying. Start troubleshooting
-  with `pennylane_whoami`.
+  with `pennylane_whoami` (company mode) or `pennylane_firm_list_companies`
+  (firm mode).
+
+## Firm mode (cabinet) — pennylane_firm_* tools
+
+The Firm API is a **separate API** for accounting firms: one firm token
+covers all the cabinet's client companies (dossiers). Different rules apply:
+
+- **Target one dossier per call** via numeric `company_id` — resolve it with
+  `pennylane_firm_list_companies` first. If the request is ambiguous about
+  which client, ask before reading — and especially before writing.
+- **Two pagination schemes:** `pennylane_firm_list_companies` and
+  `pennylane_firm_get_trial_balance` use `page`/`per_page` (page starts
+  at 1, keep going while pages come back full); every other firm list uses
+  `cursor`/`next_cursor` like v2. The no-partial-aggregation rule applies to
+  both.
+- **Accounting-focused surface:** ledger, trial balance, journals, chart of
+  accounts, fiscal years, exports (FEC/AGL), DMS, bank transactions, and
+  read-only customers/suppliers. NO invoice/quote/product creation — that
+  needs a Company token and the regular tools.
+- **Reads without a dedicated tool** → `pennylane_firm_get` (categories,
+  changelogs, DMS listings, export polling, single resources by ID…). It is
+  GET-only and always scoped to the given company_id.
+- **Don't mix the modes:** `company` (name, Company v2) and `company_id`
+  (number, Firm) are different namespaces backed by different tokens; a firm
+  token cannot call v2 tools nor vice versa.
 
 ## Write safety — three tiers
 
@@ -69,7 +95,8 @@ accounting context needed to answer finance questions correctly.
   (`match_*_transaction`); ledger level = lettering (`letter_ledger_entry_lines`).
 - **Manual journal entry:** resolve internal IDs first (`list_journals`,
   `list_ledger_accounts` — tools want IDs, not account numbers like "601"),
-  then create the balanced entry.
+  then create the balanced entry. Same flow in firm mode with the
+  `pennylane_firm_*` equivalents (note: firm entries require a `label`).
 - **Categorize means REPLACE:** the categorize tools overwrite the
   resource's category list. When the user means "add", read current
   categories first (via `pennylane_get` path `categories` for IDs).
@@ -81,7 +108,8 @@ accounting context needed to answer finance questions correctly.
   below.
 - **Full book extract** → `pennylane_create_export` (FEC / general ledger),
   async: poll with `pennylane_get` until the download URL appears. Don't
-  page through all ledger entries on a large book.
+  page through all ledger entries on a large book. Firm mode: same pattern
+  with `pennylane_firm_create_export` + `pennylane_firm_get`.
 - **"What changed since X"** → changelog endpoints via `pennylane_get`
   (e.g. path `customers/changes`).
 - **No dedicated tool?** → `pennylane_get` reaches every v2 GET endpoint

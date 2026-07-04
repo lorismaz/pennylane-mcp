@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
-Pennylane MCP Server (Company API v2).
+Pennylane MCP Server (Company API v2 + Firm API v1).
 
 A starter Model Context Protocol server for Pennylane — the all-in-one
 accounting & finance OS for French SMEs. It wraps the Company API v2 so an
 agent can read invoices, suppliers, customers, transactions, the ledger and
 accounting reports, and create a few core resources (customers, draft invoices).
+It also wraps the Firm API v1 so an accounting firm (cabinet) token can work
+across all of the firm's client companies (dossiers).
 
 Highlights
 ----------
 * Multi-company: configure several Pennylane companies (e.g. Acme + Beta),
   each with its own API token. Every tool accepts an optional `company`.
+* Firm mode: one PENNYLANE_FIRM_API_KEY unlocks the pennylane_firm_* tools —
+  a separate API (/api/external/firm/v1) where the client company is selected
+  per call via `company_id` (discover IDs with pennylane_firm_list_companies).
 * Rate-limit aware: respects Pennylane's 25 requests / 5 seconds limit and the
   `retry-after` header on 429s, with automatic backoff + retry.
 * Cursor pagination + the documented `filter` query language are first-class.
-* Forward-compatible with the 2026 API changes (sends X-Use-2026-API-Changes).
-* A generic read-only `pennylane_get` escape hatch covers every GET endpoint in
-  the API that doesn't (yet) have a dedicated tool.
+* Forward-compatible with the 2026 API changes (sends X-Use-2026-API-Changes
+  on Company v2 calls; the firm API is unaffected and never gets the header).
+* Generic read-only escape hatches (`pennylane_get`, `pennylane_firm_get`)
+  cover every GET endpoint that doesn't (yet) have a dedicated tool.
 
 Auth tokens are read from the environment and are NEVER returned by any tool.
 
@@ -33,11 +39,21 @@ PENNYLANE_API_BASE_URL      Override the API base (default production v2).
 PENNYLANE_USE_2026_CHANGES  "true"/"false" — opt in/out of 2026 API behavior
                             (default "true", which is the API default during the
                             2026 sunset phase and mandatory from 2026-07-01).
+
+PENNYLANE_FIRM_API_KEY      Accounting-firm token (Pennylane: Firm settings ->
+                            Firm Tokens). Enables the pennylane_firm_* tools.
+                            (PENNYLANE_FIRM_TOKEN is accepted as an alias.)
+PENNYLANE_FIRM_DEFAULT_COMPANY_ID
+                            Numeric client-company ID used when a firm tool
+                            call omits `company_id` (optional).
+PENNYLANE_FIRM_API_BASE_URL Override the firm API base (default production
+                            /api/external/firm/v1).
 """
 
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -198,6 +214,39 @@ def _load_companies() -> dict[str, str]:
 COMPANIES = _load_companies()
 DEFAULT_COMPANY = os.environ.get("PENNYLANE_DEFAULT_COMPANY", "").strip().lower() or None
 
+# --- Firm API (cabinet / accounting-firm token) --------------------------- #
+# The Firm API is a SEPARATE API from Company v2: its own base URL
+# (/api/external/firm/v1), the client company selected via
+# /companies/{company_id}/ in the path, and its own scopes. A firm token is
+# NOT valid on the v2 endpoints and vice versa.
+DEFAULT_FIRM_BASE_URL = "https://app.pennylane.com/api/external/firm/v1"
+FIRM_API_BASE_URL = os.environ.get(
+    "PENNYLANE_FIRM_API_BASE_URL", DEFAULT_FIRM_BASE_URL
+).rstrip("/")
+FIRM_TOKEN = (
+    os.environ.get("PENNYLANE_FIRM_API_KEY")
+    or os.environ.get("PENNYLANE_FIRM_TOKEN")  # alias, for parity with other tools
+    or None
+)
+
+
+def _load_firm_default_company_id() -> Optional[int]:
+    raw = os.environ.get("PENNYLANE_FIRM_DEFAULT_COMPANY_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"[pennylane_mcp] WARNING: PENNYLANE_FIRM_DEFAULT_COMPANY_ID={raw!r} "
+            "is not an integer and was ignored.",
+            file=sys.stderr,
+        )
+        return None
+
+
+FIRM_DEFAULT_COMPANY_ID = _load_firm_default_company_id()
+
 
 # --------------------------------------------------------------------------- #
 # Core infrastructure: auth resolution, HTTP client, errors, formatting
@@ -233,7 +282,7 @@ def _resolve_company(company: Optional[str]) -> str:
     )
 
 
-def _headers(token: str, json_content: bool = True) -> dict[str, str]:
+def _headers(token: str, json_content: bool = True, use_2026: bool = True) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -241,28 +290,28 @@ def _headers(token: str, json_content: bool = True) -> dict[str, str]:
     if json_content:
         # Omitted for multipart uploads so httpx can set the boundary itself.
         headers["Content-Type"] = "application/json"
-    if USE_2026_CHANGES:
+    if USE_2026_CHANGES and use_2026:
+        # The 2026 opt-in only exists on Company v2 — never sent to firm/v1.
         headers["X-Use-2026-API-Changes"] = "true"
     return headers
 
 
-async def _request(
+async def _send(
     method: str,
+    url: str,
+    headers: dict[str, str],
     path: str,
-    company: Optional[str],
+    auth_desc: str,
     params: Optional[dict[str, Any]] = None,
     json_body: Optional[Any] = None,  # dict for most endpoints; some take a JSON array
     files: Optional[dict[str, Any]] = None,
 ) -> Any:
-    """Perform an authenticated request against the Pennylane v2 API.
+    """Shared HTTP loop for both the Company v2 and Firm v1 APIs.
 
     Handles 429 rate limiting transparently (honoring `retry-after`) and raises
     PennylaneError with an actionable message on failure. Pass `files` for a
     multipart upload (e.g. file_attachments); otherwise `json_body` is sent.
     """
-    key = _resolve_company(company)
-    token = COMPANIES[key]
-    url = f"{API_BASE_URL}/{path.lstrip('/')}"
     is_multipart = files is not None
 
     attempt = 0
@@ -272,7 +321,7 @@ async def _request(
                 resp = await client.request(
                     method.upper(),
                     url,
-                    headers=_headers(token, json_content=not is_multipart),
+                    headers=headers,
                     params=params,
                     json=None if is_multipart else json_body,
                     files=files,
@@ -295,7 +344,7 @@ async def _request(
                 continue
 
             if resp.status_code >= 400:
-                raise PennylaneError(_describe_http_error(resp, key))
+                raise PennylaneError(_describe_http_error(resp, auth_desc))
 
             if resp.status_code == 204 or not resp.content:
                 return {"status": "ok", "http_status": resp.status_code}
@@ -305,7 +354,66 @@ async def _request(
                 return {"raw": resp.text, "http_status": resp.status_code}
 
 
-def _describe_http_error(resp: httpx.Response, company_key: str) -> str:
+async def _request(
+    method: str,
+    path: str,
+    company: Optional[str],
+    params: Optional[dict[str, Any]] = None,
+    json_body: Optional[Any] = None,
+    files: Optional[dict[str, Any]] = None,
+) -> Any:
+    """Perform an authenticated request against the Pennylane Company v2 API."""
+    key = _resolve_company(company)
+    token = COMPANIES[key]
+    url = f"{API_BASE_URL}/{path.lstrip('/')}"
+    headers = _headers(token, json_content=files is None)
+    return await _send(method, url, headers, path, f"company '{key}'",
+                       params, json_body, files)
+
+
+async def _firm_request(
+    method: str,
+    path: str,
+    params: Optional[dict[str, Any]] = None,
+    json_body: Optional[Any] = None,
+    files: Optional[dict[str, Any]] = None,
+) -> Any:
+    """Perform an authenticated request against the Pennylane Firm v1 API.
+
+    Uses the firm token and firm base URL; the 2026 opt-in header is never sent
+    (it only concerns Company v2).
+    """
+    if not FIRM_TOKEN:
+        raise PennylaneError(
+            "No Pennylane firm token is configured. Set PENNYLANE_FIRM_API_KEY "
+            "in the environment (generate one in Pennylane: Firm settings -> "
+            "Firm Tokens). See the README."
+        )
+    url = f"{FIRM_API_BASE_URL}/{path.lstrip('/')}"
+    headers = _headers(FIRM_TOKEN, json_content=files is None, use_2026=False)
+    return await _send(method, url, headers, path, "the firm token",
+                       params, json_body, files)
+
+
+def _resolve_firm_company_id(company_id: Optional[int]) -> int:
+    """Pick the client company (dossier) a firm call targets, or raise."""
+    if company_id is not None:
+        return company_id
+    if FIRM_DEFAULT_COMPANY_ID is not None:
+        return FIRM_DEFAULT_COMPANY_ID
+    raise PennylaneError(
+        "No company_id given. Firm API calls target one client company: pass "
+        "`company_id` explicitly (find IDs with pennylane_firm_list_companies) "
+        "or set PENNYLANE_FIRM_DEFAULT_COMPANY_ID."
+    )
+
+
+def _firm_company_path(company_id: Optional[int], suffix: str) -> str:
+    """Build a company-scoped firm path: companies/{id}/{suffix}."""
+    return f"companies/{_resolve_firm_company_id(company_id)}/{suffix.lstrip('/')}"
+
+
+def _describe_http_error(resp: httpx.Response, auth_desc: str) -> str:
     """Translate an HTTP error into an actionable, non-leaky message."""
     code = resp.status_code
     detail = ""
@@ -318,7 +426,7 @@ def _describe_http_error(resp: httpx.Response, company_key: str) -> str:
     base = {
         400: "Bad request — check filters, date formats (YYYY-MM-DD) and that "
              "numeric amounts are sent as strings.",
-        401: f"Authentication failed for company '{company_key}'. The API token "
+        401: f"Authentication failed for {auth_desc}. The API token "
              "is missing, invalid, or expired.",
         403: "Permission denied — the token is missing the required scope for "
              "this endpoint (e.g. customer_invoices:readonly).",
@@ -3209,6 +3317,888 @@ async def pennylane_send_pro_account_mandate_mail_request(params: BodyOnlyInput)
         return str(exc)
 
 
+# =========================================================================== #
+# Firm API (cabinet / accounting-firm token) — /api/external/firm/v1
+# =========================================================================== #
+# A SEPARATE API from Company v2: firm token, own base URL, the client company
+# (dossier) selected via /companies/{company_id}/ in the path, own scope names
+# (journals:all, ledger_entries:all, companies:readonly, dms_files:all, ...).
+# Company-scoped lists paginate with cursor/limit like v2; the firm-level
+# /companies list and the trial balance paginate with page/per_page.
+
+class FirmListCompaniesInput(_Base):
+    """List the accounting firm's client companies (page-based pagination)."""
+    page: Optional[int] = Field(
+        default=None, ge=1, description="Page number, starting at 1 (default 1)."
+    )
+    per_page: Optional[int] = Field(
+        default=None, ge=1, le=100, description="Items per page (default 20)."
+    )
+    filters: Optional[list[dict[str, Any]]] = Field(
+        default=None, description="Optional filter array ({field,operator,value})."
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class FirmGetCompanyInput(_Base):
+    company_id: int = Field(..., description="Pennylane company ID (see "
+                                              "pennylane_firm_list_companies).")
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class FirmListInput(_Base):
+    """Common inputs for company-scoped firm listing endpoints (cursor pagination)."""
+    company_id: Optional[int] = Field(
+        default=None,
+        description="Pennylane company ID of the client company (dossier) to "
+                    "query — from pennylane_firm_list_companies. Omit to use "
+                    "PENNYLANE_FIRM_DEFAULT_COMPANY_ID if configured.",
+    )
+    filters: Optional[list[dict[str, Any]]] = Field(
+        default=None,
+        description="Pennylane filter array ({field,operator,value}), same "
+                    "format as the v2 API.",
+    )
+    sort: Optional[str] = Field(
+        default=None, description="Sort attribute, e.g. 'date' or '-date' (descending)."
+    )
+    cursor: Optional[str] = Field(
+        default=None,
+        description="Opaque pagination cursor from a previous response's next_cursor.",
+    )
+    limit: Optional[int] = Field(
+        default=20, ge=1, le=1000, description="Max items to return (default 20)."
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+def _firm_list(path_suffix: str):
+    """Build the coroutine body shared by the company-scoped firm list tools."""
+    async def run(params: FirmListInput) -> str:
+        try:
+            query = _build_list_params(params.filters, params.cursor, params.limit,
+                                       {"sort": params.sort})
+            data = await _firm_request(
+                "GET", _firm_company_path(params.company_id, path_suffix), query)
+            return _format(data, params.response_format)
+        except PennylaneError as exc:
+            return str(exc)
+    return run
+
+
+@mcp.tool(
+    name="pennylane_firm_list_companies",
+    annotations={"title": "Firm: list client companies", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_list_companies(params: FirmListCompaniesInput) -> str:
+    """List the client companies (dossiers) visible to the firm token.
+
+    This is the entry point for all other pennylane_firm_* tools: use the
+    returned numeric `id` as `company_id`. NOTE: unlike the other list tools,
+    this endpoint paginates with page/per_page (page starts at 1), not with a
+    cursor. Requires the companies:readonly firm scope.
+
+    Args:
+        params.page (Optional[int]): Page number, starting at 1.
+        params.per_page (Optional[int]): Items per page (default 20).
+        params.filters (Optional[list]): Filter array ({field,operator,value}).
+
+    Returns:
+        str: JSON list of companies (id, name, ...), or an error string.
+    """
+    try:
+        query: dict[str, Any] = {}
+        if params.page is not None:
+            query["page"] = params.page
+        if params.per_page is not None:
+            query["per_page"] = params.per_page
+        if params.filters:
+            query["filter"] = json.dumps(params.filters)
+        data = await _firm_request("GET", "companies", query or None)
+        return _format(data, params.response_format)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+@mcp.tool(
+    name="pennylane_firm_get_company",
+    annotations={"title": "Firm: get one client company", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_get_company(params: FirmGetCompanyInput) -> str:
+    """Get the details of one client company of the firm (GET /companies/{id}).
+
+    Requires the companies:readonly firm scope.
+
+    Returns:
+        str: JSON of the company, or an error string.
+    """
+    try:
+        data = await _firm_request("GET", f"companies/{params.company_id}")
+        return _format(data, params.response_format)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+@mcp.tool(
+    name="pennylane_firm_list_customers",
+    annotations={"title": "Firm: list a client company's customers", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_list_customers(params: FirmListInput) -> str:
+    """List a client company's customers via the Firm API.
+
+    Requires the customers:readonly firm scope.
+
+    Returns:
+        str: {"items":[...], "has_more":bool, "next_cursor":str|null}.
+    """
+    return await _firm_list("customers")(params)
+
+
+@mcp.tool(
+    name="pennylane_firm_list_suppliers",
+    annotations={"title": "Firm: list a client company's suppliers", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_list_suppliers(params: FirmListInput) -> str:
+    """List a client company's suppliers via the Firm API.
+
+    Requires the suppliers:readonly firm scope.
+
+    Returns:
+        str: {"items":[...], "has_more":bool, "next_cursor":str|null}.
+    """
+    return await _firm_list("suppliers")(params)
+
+
+@mcp.tool(
+    name="pennylane_firm_list_journals",
+    annotations={"title": "Firm: list a client company's journals", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_list_journals(params: FirmListInput) -> str:
+    """List a client company's accounting journals via the Firm API.
+
+    Requires the journals:readonly (or journals:all) firm scope.
+
+    Returns:
+        str: {"items":[...], "has_more":bool, "next_cursor":str|null}.
+    """
+    return await _firm_list("journals")(params)
+
+
+@mcp.tool(
+    name="pennylane_firm_list_ledger_accounts",
+    annotations={"title": "Firm: list a client company's ledger accounts",
+                 "readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_list_ledger_accounts(params: FirmListInput) -> str:
+    """List a client company's ledger accounts (plan comptable) via the Firm API.
+
+    Useful to resolve ledger_account_id values for ledger entries. Common
+    filterable fields: number, label. Requires the ledger_accounts:readonly
+    (or ledger_accounts:all) firm scope.
+
+    Returns:
+        str: {"items":[...], "has_more":bool, "next_cursor":str|null}.
+    """
+    return await _firm_list("ledger_accounts")(params)
+
+
+@mcp.tool(
+    name="pennylane_firm_list_ledger_entries",
+    annotations={"title": "Firm: list a client company's ledger entries",
+                 "readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_list_ledger_entries(params: FirmListInput) -> str:
+    """List a client company's ledger entries via the Firm API.
+
+    By default, entries from closed/frozen fiscal periods are excluded — but
+    providing a `date` filter returns all entries in the range regardless.
+    For a full-book extract prefer pennylane_firm_create_export. Requires the
+    ledger_entries:readonly (or ledger_entries:all) firm scope.
+
+    Returns:
+        str: {"items":[...], "has_more":bool, "next_cursor":str|null}.
+    """
+    return await _firm_list("ledger_entries")(params)
+
+
+@mcp.tool(
+    name="pennylane_firm_list_ledger_entry_lines",
+    annotations={"title": "Firm: list a client company's ledger entry lines",
+                 "readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_list_ledger_entry_lines(params: FirmListInput) -> str:
+    """List a client company's ledger entry lines via the Firm API.
+
+    Requires the ledger_entries:readonly (or ledger_entries:all) firm scope.
+
+    Returns:
+        str: {"items":[...], "has_more":bool, "next_cursor":str|null}.
+    """
+    return await _firm_list("ledger_entry_lines")(params)
+
+
+@mcp.tool(
+    name="pennylane_firm_list_fiscal_years",
+    annotations={"title": "Firm: list a client company's fiscal years",
+                 "readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_list_fiscal_years(params: FirmListInput) -> str:
+    """List a client company's fiscal years via the Firm API.
+
+    Requires the fiscal_years:readonly (or fiscal_years:all) firm scope.
+
+    Returns:
+        str: {"items":[...], "has_more":bool, "next_cursor":str|null}.
+    """
+    return await _firm_list("fiscal_years")(params)
+
+
+class FirmTrialBalanceInput(_Base):
+    """Inputs for a client company's trial balance (page-based pagination)."""
+    period_start: str = Field(..., description="Start of period, YYYY-MM-DD.")
+    period_end: str = Field(..., description="End of period, YYYY-MM-DD.")
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    is_auxiliary: Optional[bool] = Field(
+        default=None, description="Include auxiliary (sub-)accounts."
+    )
+    page: Optional[int] = Field(default=None, ge=1, description="Page number, starting at 1.")
+    per_page: Optional[int] = Field(
+        default=None, ge=1, le=1000, description="Items per page (default 500)."
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+@mcp.tool(
+    name="pennylane_firm_get_trial_balance",
+    annotations={"title": "Firm: get a client company's trial balance",
+                 "readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_get_trial_balance(params: FirmTrialBalanceInput) -> str:
+    """Get a client company's trial balance (balance générale) for a period.
+
+    Returns balances per ledger account (amounts are strings). NOTE: paginates
+    with page/per_page (default 500 per page), not with a cursor. Requires the
+    trial_balance:readonly firm scope.
+
+    Args:
+        params.period_start (str), params.period_end (str): Period, YYYY-MM-DD.
+        params.is_auxiliary (Optional[bool]): Include auxiliary accounts.
+
+    Returns:
+        str: JSON trial balance rows, or an error string.
+    """
+    try:
+        query: dict[str, Any] = {
+            "period_start": params.period_start,
+            "period_end": params.period_end,
+        }
+        if params.is_auxiliary is not None:
+            query["is_auxiliary"] = params.is_auxiliary
+        if params.page is not None:
+            query["page"] = params.page
+        if params.per_page is not None:
+            query["per_page"] = params.per_page
+        data = await _firm_request(
+            "GET", _firm_company_path(params.company_id, "trial_balance"), query)
+        return _format(data, params.response_format)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmGenericGetInput(_Base):
+    """Inputs for an arbitrary read-only GET against a client company (firm API)."""
+    path: str = Field(
+        ...,
+        description="Path under companies/{company_id}/, e.g. 'categories', "
+                    "'category_groups', 'dms/files', 'dms/folders', "
+                    "'journals/123', 'exports/fecs/45', "
+                    "'changelogs/ledger_entry_lines', "
+                    "'ledger_entry_lines/9/lettered_ledger_entry_lines', "
+                    "'bank_accounts', 'transactions'. No host, no company prefix.",
+        min_length=1,
+    )
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    filters: Optional[list[dict[str, Any]]] = Field(
+        default=None, description="Optional filter array ({field,operator,value})."
+    )
+    query: Optional[dict[str, Any]] = Field(
+        default=None, description="Additional raw query params (e.g. {'cursor':'..','limit':50})."
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+@mcp.tool(
+    name="pennylane_firm_get",
+    annotations={"title": "Firm: generic GET (any firm endpoint of a client company)",
+                 "readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_get(params: FirmGenericGetInput) -> str:
+    """Read-only access to ANY company-scoped Firm API GET endpoint not covered
+    by a dedicated tool (categories, category_groups, DMS files/folders,
+    changelogs, single resources by ID, export status polling, bank_accounts,
+    transactions, lettered ledger entry lines, ...).
+
+    Only GET requests are issued — it can never modify data. The path is always
+    resolved under companies/{company_id}/ so it cannot escape the selected
+    client company.
+
+    Args:
+        params.path (str): Path under companies/{company_id}/ (see examples).
+        params.filters (Optional[list]): Filter array, applied as `filter`.
+        params.query (Optional[dict]): Extra query params (cursor, limit, dates...).
+
+    Returns:
+        str: Raw JSON response from the endpoint, or an error string.
+
+    Examples:
+        - Categories: path="categories"
+        - One journal: path="journals/123"
+        - Poll a FEC export: path="exports/fecs/45"
+        - DMS files: path="dms/files"
+        - Ledger changelog: path="changelogs/ledger_entry_lines",
+          query={"start_date":"2026-06-01"}
+    """
+    try:
+        clean = params.path.strip().lstrip("/")
+        if not clean or ".." in clean.split("/"):
+            return (f"Error: invalid path '{params.path}'. Give a relative path under "
+                    "companies/{company_id}/, e.g. 'categories' or 'journals/123'.")
+        merged = dict(params.query or {})
+        if params.filters:
+            merged["filter"] = json.dumps(params.filters)
+        data = await _firm_request(
+            "GET", _firm_company_path(params.company_id, clean), merged or None)
+        return _format(data, params.response_format)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+# --- Firm writes: accounting structure, entries, transactions, files ------- #
+
+class FirmCreateJournalInput(_Base):
+    """Create an accounting journal in a client company (firm API)."""
+    code: str = Field(..., description="Short journal code, e.g. 'VE'.", min_length=1)
+    label: str = Field(..., description="Journal name, e.g. 'Sales'.", min_length=1)
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    extra_fields: Optional[dict[str, Any]] = Field(
+        default=None, description="Any other journal fields passed straight through."
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_create_journal",
+    annotations={"title": "Firm: create a journal", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_create_journal(params: FirmCreateJournalInput) -> str:
+    """Create an accounting journal in a client company (firm API).
+
+    Unlike Company v2, the firm endpoint requires BOTH `code` and `label`.
+    Requires the journals:all firm scope.
+
+    Returns:
+        str: JSON of the created journal (with its internal id), or an error string.
+    """
+    try:
+        payload: dict[str, Any] = {"code": params.code, "label": params.label}
+        if params.extra_fields:
+            payload.update(params.extra_fields)
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "journals"), json_body=payload)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmCreateLedgerAccountInput(_Base):
+    """Create a ledger account in a client company (firm API)."""
+    number: str = Field(..., description="Account number, e.g. '706000'.", min_length=1)
+    label: str = Field(..., description="Account label.", min_length=1)
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    extra_fields: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Any other account fields passed through (vat_rate, country_alpha2).",
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_create_ledger_account",
+    annotations={"title": "Firm: create a ledger account", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_create_ledger_account(params: FirmCreateLedgerAccountInput) -> str:
+    """Create a ledger account (plan comptable entry) in a client company.
+
+    Requires the ledger_accounts:all firm scope.
+
+    Returns:
+        str: JSON of the created ledger account (with its internal id), or an error.
+    """
+    try:
+        payload: dict[str, Any] = {"number": params.number, "label": params.label}
+        if params.extra_fields:
+            payload.update(params.extra_fields)
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "ledger_accounts"),
+            json_body=payload)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmUpdateByIdInput(_Base):
+    """Update a client-company resource by ID (firm API)."""
+    id: str = Field(..., description="Internal ID of the resource to update.", min_length=1)
+    fields: dict[str, Any] = Field(
+        ...,
+        description="Object of fields to change. Include only what you want to "
+                    "modify. Monetary amounts must be sent as STRINGS.",
+    )
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_update_ledger_account",
+    annotations={"title": "Firm: update a ledger account", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_update_ledger_account(params: FirmUpdateByIdInput) -> str:
+    """Update a client company's ledger account (PUT — common fields: label,
+    letterable). Requires the ledger_accounts:all firm scope.
+
+    Returns:
+        str: JSON of the updated ledger account, or an error string.
+    """
+    try:
+        data = await _firm_request(
+            "PUT", _firm_company_path(params.company_id, f"ledger_accounts/{params.id}"),
+            json_body=params.fields)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmCreateLedgerEntryInput(_Base):
+    """Create a balanced ledger entry in a client company (firm API)."""
+    date: str = Field(..., description="Entry date, YYYY-MM-DD.")
+    label: str = Field(..., description="Entry label / description (required here, "
+                                        "unlike Company v2).", min_length=1)
+    journal_id: int = Field(..., description="Journal internal ID (see "
+                                             "pennylane_firm_list_journals).")
+    ledger_entry_lines: list[dict[str, Any]] = Field(
+        ...,
+        description='Double-entry lines (>=2). Each: {"ledger_account_id":int,'
+                    '"label":str,"debit":"<string>","credit":"<string>"}. Amounts '
+                    'are STRINGS; total debits MUST equal total credits. Put "0" on '
+                    "the unused side of each line.",
+        min_length=2,
+    )
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    extra_fields: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Any other entry fields passed through (currency, file_attachment_id).",
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_create_ledger_entry",
+    annotations={"title": "Firm: create a ledger entry", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_create_ledger_entry(params: FirmCreateLedgerEntryInput) -> str:
+    """Create a balanced ledger (journal) entry in a client company.
+
+    Amounts are STRINGS and total debits must equal total credits, or the API
+    returns 422. Reference accounts by ledger_account_id (not account number) —
+    resolve them with pennylane_firm_list_ledger_accounts. Requires the
+    ledger_entries:all firm scope.
+
+    Returns:
+        str: JSON of the created ledger entry (with its internal id), or an error.
+    """
+    try:
+        payload: dict[str, Any] = {
+            "date": params.date,
+            "label": params.label,
+            "journal_id": params.journal_id,
+            "ledger_entry_lines": params.ledger_entry_lines,
+        }
+        if params.extra_fields:
+            payload.update(params.extra_fields)
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "ledger_entries"),
+            json_body=payload)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+@mcp.tool(
+    name="pennylane_firm_update_ledger_entry",
+    annotations={"title": "Firm: update a ledger entry", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_update_ledger_entry(params: FirmUpdateByIdInput) -> str:
+    """Update a client company's ledger entry (PUT — common fields: date, label,
+    journal_id, ledger_entry_lines with string amounts, debits = credits).
+    Requires the ledger_entries:all firm scope.
+
+    Returns:
+        str: JSON of the updated ledger entry, or an error string.
+    """
+    try:
+        data = await _firm_request(
+            "PUT", _firm_company_path(params.company_id, f"ledger_entries/{params.id}"),
+            json_body=params.fields)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmCreateFiscalYearInput(_Base):
+    """Create a fiscal year in a client company (firm API)."""
+    start: str = Field(..., description="Fiscal year start date, YYYY-MM-DD.")
+    finish: str = Field(..., description="Fiscal year end date, YYYY-MM-DD.")
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_create_fiscal_year",
+    annotations={"title": "Firm: create a fiscal year", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_create_fiscal_year(params: FirmCreateFiscalYearInput) -> str:
+    """Create a fiscal year in a client company. Fiscal years must be
+    consecutive and cannot overlap. Requires the fiscal_years:all firm scope.
+
+    Returns:
+        str: JSON of the created fiscal year, or an error string.
+    """
+    try:
+        payload = {"start": params.start, "finish": params.finish}
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "fiscal_years"),
+            json_body=payload)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmCreateTransactionInput(_Base):
+    """Create a bank transaction in a client company (firm API)."""
+    bank_account_id: int = Field(..., description="Bank account internal ID.")
+    label: str = Field(..., description="Transaction label.", min_length=1)
+    date: str = Field(..., description="Transaction date, YYYY-MM-DD.")
+    amount: str = Field(..., description='Amount as a STRING, e.g. "125.50" '
+                                         '(negative for debits).')
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    extra_fields: Optional[dict[str, Any]] = Field(
+        default=None, description="Any other transaction fields passed through (fee)."
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_create_transaction",
+    annotations={"title": "Firm: create a bank transaction", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_create_transaction(params: FirmCreateTransactionInput) -> str:
+    """Create a banking transaction in a client company (firm API).
+
+    Requires the transactions:all firm scope.
+
+    Returns:
+        str: JSON of the created transaction (with its internal id), or an error.
+    """
+    try:
+        payload: dict[str, Any] = {
+            "bank_account_id": params.bank_account_id,
+            "label": params.label,
+            "date": params.date,
+            "amount": params.amount,
+        }
+        if params.extra_fields:
+            payload.update(params.extra_fields)
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "transactions"),
+            json_body=payload)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+@mcp.tool(
+    name="pennylane_firm_update_transaction",
+    annotations={"title": "Firm: update a bank transaction", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def pennylane_firm_update_transaction(params: FirmUpdateByIdInput) -> str:
+    """Update a client company's bank transaction (PUT). Requires the
+    transactions:all firm scope.
+
+    Returns:
+        str: JSON of the updated transaction, or an error string.
+    """
+    try:
+        data = await _firm_request(
+            "PUT", _firm_company_path(params.company_id, f"transactions/{params.id}"),
+            json_body=params.fields)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmCreateWithFieldsInput(_Base):
+    """Create a client-company resource by passing the full payload (firm API)."""
+    fields: dict[str, Any] = Field(
+        ..., description="The full create payload as an object. Monetary amounts as strings."
+    )
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_create_bank_account",
+    annotations={"title": "Firm: create a bank account", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_create_bank_account(params: FirmCreateWithFieldsInput) -> str:
+    """Create a bank account in a client company (firm API).
+
+    Pass the payload in `fields` — `name` is required; common extras: iban, bic,
+    currency, account_type, bank_establishment_id. Requires the
+    bank_accounts:all firm scope.
+
+    Returns:
+        str: JSON of the created bank account (with its internal id), or an error.
+    """
+    try:
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "bank_accounts"),
+            json_body=params.fields)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmExportKind(str, Enum):
+    """Which accounting export the firm API can generate."""
+    FEC = "fec"
+    ANALYTICAL_GENERAL_LEDGER = "analytical_general_ledger"
+
+
+_FIRM_EXPORT_PATHS = {
+    FirmExportKind.FEC: "exports/fecs",
+    FirmExportKind.ANALYTICAL_GENERAL_LEDGER: "exports/analytical_general_ledgers",
+}
+
+
+class FirmCreateExportInput(_Base):
+    """Trigger an accounting export for a client company (firm API)."""
+    kind: FirmExportKind = Field(
+        ...,
+        description="Which export to generate: 'fec' (Fichier des Écritures "
+                    "Comptables) or 'analytical_general_ledger'. (The plain "
+                    "general_ledger export exists only on Company v2.)",
+    )
+    period_start: str = Field(..., description="Start of period, YYYY-MM-DD.")
+    period_end: str = Field(..., description="End of period, YYYY-MM-DD.")
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    mode: Optional[str] = Field(
+        default=None,
+        description="Only for analytical_general_ledger: 'in_line' (default) or "
+                    "'in_column'. Ignored for FEC.",
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_create_export",
+    annotations={"title": "Firm: create an accounting export (FEC / AGL)",
+                 "readOnlyHint": False, "destructiveHint": False,
+                 "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_create_export(params: FirmCreateExportInput) -> str:
+    """Trigger a FEC or analytical general ledger export for a client company.
+
+    Exports are asynchronous: this returns an export object with an `id` and a
+    `status`. Poll it with pennylane_firm_get (path e.g. `exports/fecs/{id}` or
+    `exports/analytical_general_ledgers/{id}`) until the download URL appears.
+    Requires the matching firm scope (exports:fec or exports:agl).
+
+    Returns:
+        str: JSON of the created export (with its `id` and `status`), or an error.
+    """
+    try:
+        payload: dict[str, Any] = {
+            "period_start": params.period_start,
+            "period_end": params.period_end,
+        }
+        if params.kind == FirmExportKind.ANALYTICAL_GENERAL_LEDGER and params.mode:
+            payload["mode"] = params.mode
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, _FIRM_EXPORT_PATHS[params.kind]),
+            json_body=payload)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmUploadFileInput(_Base):
+    """Upload a local file to a client company as a file_attachment (firm API)."""
+    file_path: str = Field(..., description="Absolute path to a local file.", min_length=1)
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+
+
+def _local_file_part(file_path: str) -> tuple[str, bytes, str] | str:
+    """Read a local file for multipart upload; return an error string if missing."""
+    p = Path(file_path).expanduser()
+    if not p.is_file():
+        return f"Error: no file found at '{file_path}'. Provide an absolute path."
+    content_type = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    return (p.name, p.read_bytes(), content_type)
+
+
+@mcp.tool(
+    name="pennylane_firm_upload_file_attachment",
+    annotations={"title": "Firm: upload a file attachment", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_upload_file_attachment(params: FirmUploadFileInput) -> str:
+    """Upload a local file to a client company (multipart POST file_attachments).
+
+    Returns a file_attachment whose `id` can be referenced by other resources
+    (e.g. a ledger entry's file_attachment_id). Max 100 MB. This does NOT put
+    the file in the DMS — use pennylane_firm_upload_dms_file for that.
+    Requires the file_attachments:all firm scope.
+
+    Returns:
+        str: JSON of the uploaded attachment (with its `id`), or an error string.
+    """
+    try:
+        part = _local_file_part(params.file_path)
+        if isinstance(part, str):
+            return part
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "file_attachments"),
+            files={"file": part})
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmUploadDmsFileInput(_Base):
+    """Upload a local file into a client company's DMS / GED (firm API)."""
+    file_path: str = Field(..., description="Absolute path to a local file.", min_length=1)
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    name: Optional[str] = Field(
+        default=None, description="Display name in the DMS (defaults to the filename)."
+    )
+    parent_folder_id: Optional[int] = Field(
+        default=None,
+        description="DMS folder to file it under (see pennylane_firm_get "
+                    "path='dms/folders'). Omit for the root.",
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_upload_dms_file",
+    annotations={"title": "Firm: upload a file to the DMS (GED)", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_upload_dms_file(params: FirmUploadDmsFileInput) -> str:
+    """Upload a local file into a client company's DMS (GED) via the firm API.
+
+    Requires the dms_files:all firm scope.
+
+    Returns:
+        str: JSON of the created DMS file, or an error string.
+    """
+    try:
+        part = _local_file_part(params.file_path)
+        if isinstance(part, str):
+            return part
+        files: dict[str, Any] = {"file": part}
+        if params.name:
+            files["name"] = (None, params.name)
+        if params.parent_folder_id is not None:
+            files["parent_folder_id"] = (None, str(params.parent_folder_id))
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "dms/files"), files=files)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
+class FirmCreateDmsFolderInput(_Base):
+    """Create a DMS folder in a client company (firm API)."""
+    name: str = Field(..., description="Folder name.", min_length=1)
+    company_id: Optional[int] = Field(
+        default=None, description="Client company ID. Omit to use the configured default."
+    )
+    parent_folder_id: Optional[int] = Field(
+        default=None, description="Parent DMS folder ID. Omit for the root."
+    )
+
+
+@mcp.tool(
+    name="pennylane_firm_create_dms_folder",
+    annotations={"title": "Firm: create a DMS folder", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def pennylane_firm_create_dms_folder(params: FirmCreateDmsFolderInput) -> str:
+    """Create a DMS (GED) folder in a client company via the firm API.
+
+    Requires the dms_files:all firm scope.
+
+    Returns:
+        str: JSON of the created folder (with its internal id), or an error string.
+    """
+    try:
+        payload: dict[str, Any] = {"name": params.name}
+        if params.parent_folder_id is not None:
+            payload["parent_folder_id"] = params.parent_folder_id
+        data = await _firm_request(
+            "POST", _firm_company_path(params.company_id, "dms/folders"),
+            json_body=payload)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except PennylaneError as exc:
+        return str(exc)
+
+
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
@@ -3216,8 +4206,12 @@ async def pennylane_send_pro_account_mandate_mail_request(params: BodyOnlyInput)
 def _print_startup_info() -> None:
     """Print non-secret startup info to stderr (safe for stdio transport)."""
     names = ", ".join(sorted(COMPANIES)) if COMPANIES else "(none configured)"
+    firm = "configured" if FIRM_TOKEN else "(not configured)"
+    if FIRM_TOKEN and FIRM_DEFAULT_COMPANY_ID is not None:
+        firm += f", default company_id={FIRM_DEFAULT_COMPANY_ID}"
     print(f"[pennylane_mcp] base_url={API_BASE_URL}", file=sys.stderr)
     print(f"[pennylane_mcp] companies={names}", file=sys.stderr)
+    print(f"[pennylane_mcp] firm_api={firm} (base_url={FIRM_API_BASE_URL})", file=sys.stderr)
     print(f"[pennylane_mcp] use_2026_changes={USE_2026_CHANGES}", file=sys.stderr)
 
 

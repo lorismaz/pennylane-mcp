@@ -1008,7 +1008,7 @@ async def pennylane_create_company_customer(params: CreateCompanyCustomerInput) 
             payload["emails"] = params.emails
         if params.extra_fields:
             payload.update(params.extra_fields)
-        data = await _request("POST", "customers/company", params.company, json_body=payload)
+        data = await _request("POST", "company_customers", params.company, json_body=payload)
         return json.dumps(data, indent=2, ensure_ascii=False)
     except PennylaneError as exc:
         return str(exc)
@@ -1270,7 +1270,7 @@ async def pennylane_finalize_customer_invoice(params: GetByIdInput) -> str:
         str: JSON of the finalized invoice (now with invoice_number, draft=false).
     """
     try:
-        data = await _request("POST", f"customer_invoices/{params.id}/finalize", params.company)
+        data = await _request("PUT", f"customer_invoices/{params.id}/finalize", params.company)
         return _format(data, params.response_format)
     except PennylaneError as exc:
         return str(exc)
@@ -1335,7 +1335,7 @@ async def pennylane_mark_customer_invoice_as_paid(params: GetByIdInput) -> str:
         str: Confirmation (HTTP 204) or an error string.
     """
     try:
-        data = await _request("POST", f"customer_invoices/{params.id}/mark_as_paid", params.company)
+        data = await _request("PUT", f"customer_invoices/{params.id}/mark_as_paid", params.company)
         return json.dumps(data, indent=2, ensure_ascii=False)
     except PennylaneError as exc:
         return str(exc)
@@ -1597,7 +1597,7 @@ async def pennylane_delete_draft_customer_invoice(params: GetByIdInput) -> str:
                  "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 async def pennylane_update_company_customer(params: UpdateByIdInput) -> str:
-    """Update a company (business) customer (PUT /customers/company/{id}).
+    """Update a company (business) customer (PUT /company_customers/{id}).
 
     Common fields: name, reg_no, vat_number, emails, address, billing_address.
     Requires the customers:all scope.
@@ -1610,7 +1610,7 @@ async def pennylane_update_company_customer(params: UpdateByIdInput) -> str:
         str: JSON of the updated customer, or an error string.
     """
     try:
-        data = await _request("PUT", f"customers/company/{params.id}", params.company,
+        data = await _request("PUT", f"company_customers/{params.id}", params.company,
                               json_body=params.fields)
         return json.dumps(data, indent=2, ensure_ascii=False)
     except PennylaneError as exc:

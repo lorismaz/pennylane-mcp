@@ -94,6 +94,7 @@ La surface de l'API Firm est centrée sur la comptabilité : elle ne permet **pa
 ## Prérequis
 
 - Python **3.10+**
+- Le SDK Python officiel MCP **2.x** (`mcp>=2.3.0,<3`, installé via `requirements.txt`). Le serveur annonce la révision de protocole **2026-07-28** et répond encore au handshake `initialize` des clients plus anciens. Le lancement stdio ne change pas : `python server.py`.
 - Un token **API Company** Pennylane (un par société), créé dans Pennylane sous **Paramètres → Connectivité / API** — et/ou un token **API Firm** (cabinets comptables), créé sous **Paramètres du cabinet → Tokens du cabinet**.
 
 ## Installation

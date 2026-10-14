@@ -260,7 +260,7 @@ def test_method_and_path(http, func, params, method, path):
 
 def test_every_registered_tool_is_covered():
     """Guard: adding a tool without a test case fails here."""
-    registered = {t.name for t in server.mcp._tool_manager.list_tools()}
+    registered = {t.name for t in asyncio.run(server.mcp.list_tools())}
     covered = ({f.__name__ for f, *_ in CASES}
                | {name for name, *_ in FIRM_CASES}
                | {"pennylane_list_companies"})

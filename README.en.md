@@ -94,6 +94,7 @@ The Firm API surface is accounting-focused: it has **no** customer-invoice/quote
 ## Requirements
 
 - Python **3.10+**
+- The official MCP Python SDK **2.x** (`mcp>=2.3.0,<3`, installed from `requirements.txt`). The server advertises protocol revision **2026-07-28** and still completes the `initialize` handshake for earlier clients. The stdio launch is unchanged: `python server.py`.
 - A Pennylane **Company API** token (one per company), created in Pennylane under **Settings → Connectivity / API** — and/or a **Firm API** token (accounting practices), created under **Firm settings → Firm Tokens**.
 
 ## Installation

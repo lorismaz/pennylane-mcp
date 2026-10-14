@@ -64,13 +64,14 @@ from typing import Any, Optional
 
 import httpx
 from pydantic import BaseModel, Field, ConfigDict
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 # --------------------------------------------------------------------------- #
 # Constants & configuration
 # --------------------------------------------------------------------------- #
 
-mcp = FastMCP("pennylane_mcp")
+# SDK 2.x advertises protocol 2026-07-28 and still serves the initialize handshake.
+mcp = MCPServer("pennylane_mcp")
 
 
 def _load_dotenv() -> None:
